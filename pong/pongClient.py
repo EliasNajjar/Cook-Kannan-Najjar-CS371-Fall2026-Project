@@ -13,8 +13,8 @@ import socket
 
 from assets.code.helperCode import *
 
-# This is the main game loop.  For the most part, you will not need to modify this.  The sections
-# where you should add to the code are marked.  Feel free to change any part of this project
+# This is the main game loop. For the most part, you will not need to modify this. The sections
+# where you should add to the code are marked. Feel free to change any part of this project
 # to suit your needs.
 def playGame(screenWidth:int, screenHeight:int, playerPaddle:str, client:socket.socket) -> None:
     
@@ -145,7 +145,7 @@ def playGame(screenWidth:int, screenHeight:int, playerPaddle:str, client:socket.
         pygame.draw.rect(screen, WHITE, topWall)
         pygame.draw.rect(screen, WHITE, bottomWall)
         scoreRect = updateScore(lScore, rScore, screen, WHITE, scoreFont)
-        pygame.display.update([topWall, bottomWall, ball, leftPaddle, rightPaddle, scoreRect, winMessage])
+        pygame.display.update()
         clock.tick(60)
         
         # This number should be synchronized between you and your opponent.  If your number is larger
