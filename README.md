@@ -3,7 +3,7 @@
 Group Members & Email Addresses:
 
 Mohandass Kannan, mka377@uky.edu\
-Elias Najjar, esna222@uky.edu
+Elias Najjar, esna222@uky.edu\
 Hayden Cook, hwco227@uky.edu
 
 ## Versioning
