@@ -1,5 +1,9 @@
-"""Simulate independent Pong matches and serve an in-memory leaderboard."""
+# Contributing Authors: Hayden Cook, Mohandass Kannan, and Elias Najjar
+# Email Addresses: hwco227@uky.edu, mka377@uky.edu, and esna222@uky.edu
+# Date: November 22, 2026
+# Purpose: Simulate game, handle clients, and host leaderboard
 
+import argparse
 import socket
 import json
 from typing import BinaryIO
@@ -13,10 +17,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pygame
 
-
 def sendMessage(conn: socket.socket, message: dict) -> None:
     conn.sendall((json.dumps(message) + "\n").encode("utf-8"))
-
 
 def receiveMessage(stream: BinaryIO) -> dict:
     # A buffered reader preserves extra messages and joins fragmented TCP reads.
@@ -383,8 +385,18 @@ th{color:#89e2cb}footer{margin-top:24px;color:#afbdd3;font-size:.9rem}
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Run the Pong game server and leaderboard.")
+    parser.add_argument("--host", default="0.0.0.0", help="address to listen on (default: all interfaces)")
+    parser.add_argument("--port", type=int, default=65432, help="game port (default: 65432)")
+    parser.add_argument("--leaderboard-port", type=int, default=80, help="HTTP port (default: 80)")
+    args = parser.parse_args()
+    for port in (args.port, args.leaderboard_port):
+        if not 0 <= port <= 65535:
+            parser.error("ports must be between 0 and 65535")
     try:
-        PongServer().serve()
+        PongServer().serve(args.host, args.port, args.leaderboard_port)
     except KeyboardInterrupt:
         pass
+    except OSError as error:
+        parser.exit(1, f"Pong server could not start or continue: {error}\n")
 

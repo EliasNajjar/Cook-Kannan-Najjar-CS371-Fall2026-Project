@@ -10,37 +10,43 @@ Hayden Cook, hwco227@uky.edu
 
 Github Link: https://github.com/EliasNajjar/Kannan-Najjar-CS371-Fall2026-Project
 
-## General Info
-This file describes how to install/run your program and anything else you think the user should know
-
 ## Install Instructions
 
-Run the following line to install the required libraries for this project:
+Use Python 3.10 or later with Tkinter installed. From the project directory, install the dependency:
 
-`pip3 install -r requirements.txt`
+```sh
+python -m pip install -r requirements.txt
+```
 
 ## Running the game
 
 From the project directory, start the server:
 
 ```sh
-python pong/pongServer.py
+python -B pong/pongServer.py --leaderboard-port 8080
 ```
 
 Start a client on each player's computer (or two clients locally):
 
 ```sh
-python pong/pongClient.py
+python -B pong/pongClient.py
 ```
 
-Enter the server computer's IP address and port `65432`. For local testing, use
-`127.0.0.1`. Use the up and down arrow keys to move your paddle. The server
-listens on all interfaces; remote connections require TCP port 65432 to be
-reachable through the host's firewall.
+Enter the server's IP address, game port `65432`, a username, and one to three
+initials. For local testing, use `127.0.0.1` and a different username in each
+client. Use the up and down arrow keys to move your paddle. The server listens
+on all interfaces by default. For LAN play, make TCP port `65432` reachable
+through the server computer's firewall.
 
-The match starts when two players connect. First to five points wins. A third
-client receives a game-full message. If a player leaves, the match resets and
-the remaining player waits for a replacement. Close the game window to leave.
+The server pairs players as they join and can run multiple matches at once.
+First to five points wins. Both players must click **Play Again** for a rematch.
+Close the game window to leave. The remaining player returns to matchmaking.
+
+With the example command, open `http://127.0.0.1:8080/leaderboard` on the server
+computer to see the leaderboard. For LAN access, use the server's IP address
+and make TCP port `8080` reachable. The leaderboard resets when the server
+restarts. The default HTTP port is `80` when `--leaderboard-port` is omitted.
+Use `--port` to change the game port and enter that port in each client.
 
 ## Client and server responsibilities
 
@@ -55,15 +61,17 @@ detection at 60 ticks per second. Both clients receive state from this single
 simulation. Paddle positions are client-controlled; movement-speed validation is
 not implemented.
 
-TCP messages use newline-delimited JSON. The initial `hello` contains `width`,
-`height`, and `side`. Each `paddle` message contains `y`; its `state` response
-contains both paddle positions, ball position, scores, winner, readiness, tick,
-and cumulative point/bounce counters for sound playback. A buffered reader and
-`sendall` handle fragmented and combined TCP messages. Connections time out after
-five seconds without a completed network operation.
+TCP messages use newline-delimited JSON. The client sends a `join` with a
+username and initials, and the server replies with a `hello` containing the
+court dimensions. The client then sends `update` messages with its paddle
+position, the match and round identifiers, and its rematch choice. The server
+replies with a `state` snapshot for that player. Connections time out after five
+seconds without a completed network operation.
 
 ## Verification
 
-```sh
-python -m unittest discover -s tests -v
-```
+To verify a local setup, start the server and two clients. Move each paddle and
+confirm both windows show the same ball and scores. Play to five points, check
+the winner's leaderboard entry, and click **Play Again** in both windows to
+confirm the scores reset. Close one window and confirm the other returns to
+matchmaking.

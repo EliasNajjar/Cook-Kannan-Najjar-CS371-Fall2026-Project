@@ -8,7 +8,7 @@ import threading
 from pathlib import Path
 from typing import BinaryIO
 
-from assets.code.helperCode import updateScore
+from assets.code.helperCode import Paddle, updateScore
 
 
 def sendMessage(conn: socket.socket, message: dict) -> None:
@@ -36,10 +36,9 @@ class Paddles:
 
     def __init__(self, width: int, height: int) -> None:
         self.height = height
-        self.speed = 5
-        self.rects = {
-            "left": pygame.Rect(10, height // 2 - 25, 10, 50),
-            "right": pygame.Rect(width - 20, height // 2 - 25, 10, 50),
+        self.bySide = {
+            "left": Paddle(pygame.Rect(10, height // 2 - 25, 10, 50)),
+            "right": Paddle(pygame.Rect(width - 20, height // 2 - 25, 10, 50)),
         }
         self.token = None
 
@@ -47,27 +46,27 @@ class Paddles:
         side = state.get("side")
         token = (state.get("match_id"), state.get("round"))
         if token != self.token:
-            for rect in self.rects.values():
-                rect.y = self.height // 2 - 25
-            if side in self.rects:
-                self.rects[side].topleft = state["paddles"][side]
+            for paddle in self.bySide.values():
+                paddle.rect.y = self.height // 2 - 25
+            if side in self.bySide:
+                self.bySide[side].rect.topleft = state["paddles"][side]
             self.token = token
-        if side not in self.rects:
+        if side not in self.bySide:
             return self.height // 2 - 25
         # Move only our paddle locally; the opponent comes from the server.
         keys = pygame.key.get_pressed()
         movement = int(keys[pygame.K_DOWN]) - int(keys[pygame.K_UP])
+        own = self.bySide[side]
         if state.get("phase") == "playing" and connected:
-            rect = self.rects[side]
-            rect.y = max(10, min(self.height - 60, rect.y + movement * self.speed))
-        for other, rect in self.rects.items():
+            own.rect.y = max(10, min(self.height - 60, own.rect.y + movement * own.speed))
+        for other, paddle in self.bySide.items():
             if other != side:
-                rect.topleft = state["paddles"][other]
-        return self.rects[side].y
+                paddle.rect.topleft = state["paddles"][other]
+        return own.rect.y
 
     def draw(self, screen: pygame.Surface, color: tuple) -> None:
-        for rect in self.rects.values():
-            pygame.draw.rect(screen, color, rect)
+        for paddle in self.bySide.values():
+            pygame.draw.rect(screen, color, paddle.rect)
 
 
 class ServerConnection:
@@ -77,6 +76,7 @@ class ServerConnection:
         self.client = client
         self.stream = stream
         self.y = startY
+        self.inputToken = (None, None)
         self.state: dict | None = None
         self.rematch: tuple | None = None
         self.error = ""
@@ -88,8 +88,8 @@ class ServerConnection:
         try:
             while not self.stopped.is_set():
                 with self.lock:
-                    state = self.state or {}
-                    token = (state.get("match_id"), state.get("round"))
+                    # The position and its round come from the same rendered frame.
+                    token = self.inputToken
                     message = {"type": "update", "y": self.y,
                                "match_id": token[0], "round": token[1],
                                "play_again": self.rematch is not None and self.rematch == token}
@@ -182,13 +182,13 @@ def playGame(screenWidth: int, screenHeight: int, username: str,
 
             paddleY = paddles.update(state, connected=not error)
             with connection.lock:
-                connection.y = paddleY
+                connection.y, connection.inputToken = paddleY, token
 
             lScore = rScore = 0
             status = "Connecting..."
             if phase == "waiting":
                 status = "Waiting for opponent..."
-            elif side in paddles.rects:
+            elif side in paddles.bySide:
                 ball.topleft = state["ball"]
                 lScore, rScore = state["score"]["left"], state["score"]["right"]
                 if state["points"] > lastPoints:
@@ -205,7 +205,7 @@ def playGame(screenWidth: int, screenHeight: int, username: str,
                 pygame.draw.rect(screen, WHITE, rect)
             paddles.draw(screen, WHITE)
             updateScore(lScore, rScore, screen, WHITE, scoreFont)
-            if side in paddles.rects:
+            if side in paddles.bySide:
                 for playerSide, x in (("left", screenWidth // 4), ("right", 3 * screenWidth // 4)):
                     label = state["players"][playerSide]["username"]
                     surface = nameFont.render(label, False, WHITE, (0, 0, 0))
