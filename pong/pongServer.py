@@ -1,9 +1,14 @@
+# =================================================================================================
 # Contributing Authors: Hayden Cook, Mohandass Kannan, and Elias Najjar
 # Email Addresses: hwco227@uky.edu, mka377@uky.edu, and esna222@uky.edu
 # Date: November 22, 2026
 # Purpose: Simulate game, handle clients, and host leaderboard
+# =================================================================================================
 
 import argparse
+import hashlib
+import hmac
+import secrets
 import socket
 import json
 from typing import BinaryIO
@@ -17,17 +22,30 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pygame
 
+from cryptography.fernet import Fernet, InvalidToken
+
+
+# Shared key for the LAN demo. Anyone with the client has access to this key.
+FERNET = Fernet(b"xpg5hCKM6RP-Fxp71EQymasFcJ4gsZL-RkpaEwPUCiw=")
+MAX_TOKEN_LINE = 8192
+
+
 def sendMessage(conn: socket.socket, message: dict) -> None:
-    conn.sendall((json.dumps(message) + "\n").encode("utf-8"))
+    payload = json.dumps(message).encode("utf-8")
+    conn.sendall(FERNET.encrypt(payload) + b"\n")
 
 def receiveMessage(stream: BinaryIO) -> dict:
     # A buffered reader preserves extra messages and joins fragmented TCP reads.
-    line = stream.readline(4097)
+    line = stream.readline(MAX_TOKEN_LINE + 1)
     if not line:
         raise EOFError("Server or player disconnected")
-    if len(line) > 4096 or not line.endswith(b"\n"):
+    if len(line) > MAX_TOKEN_LINE or not line.endswith(b"\n"):
         raise ValueError("Invalid message length")
-    message = json.loads(line)
+    try:
+        payload = FERNET.decrypt(line[:-1])
+    except InvalidToken as error:
+        raise ValueError("Invalid encrypted message") from error
+    message = json.loads(payload)
     if not isinstance(message, dict):
         raise ValueError("Expected a JSON object")
     return message
@@ -186,22 +204,36 @@ class PongServer:
     def register(self, conn: socket.socket, message: dict) -> Player:
         username = message.get("username")
         initials = message.get("initials")
+        password = message.get("password")
         if message.get("type") != "join":
-            raise ValueError("Enter a username and initials to join.")
+            raise ValueError("Enter a username, initials and password to join.")
         if not isinstance(username, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,20}", username):
             raise ValueError("Username: use 1-20 letters, numbers, underscores or hyphens.")
         if not isinstance(initials, str) or not re.fullmatch(r"[A-Za-z]{1,3}", initials):
             raise ValueError("Initials: use 1-3 letters.")
+        if not isinstance(password, str) or not 1 <= len(password) <= 128:
+            raise ValueError("Password: use 1-128 characters.")
         key = username.casefold()
+        initials = initials.upper()
+        with self.lock:
+            record = self.players.get(key)
+        salt = secrets.token_bytes(16) if record is None else record["salt"]
+        # Password hashing must not hold the lock used by the game simulation.
+        passwordHash = hashlib.scrypt(password.encode("utf-8"), salt=salt,
+                                      n=2**15, r=8, p=3, maxmem=64 * 1024**2, dklen=32)
+        if record is not None:
+            passwordMatches = hmac.compare_digest(passwordHash, record["password_hash"])
+            if not passwordMatches or record["initials"] != initials:
+                raise ValueError("Incorrect password or initials for that username.")
         with self.lock:
             if key in self.clients:
                 raise ValueError("That username is already connected.")
-            record = self.players.get(key)
+            if self.players.get(key) is not record:
+                raise ValueError("That username was just registered. Try joining again.")
             if record is None:
-                record = {"username": username, "initials": initials.upper(), "wins": 0}
+                record = {"username": username, "initials": initials, "wins": 0,
+                          "salt": salt, "password_hash": passwordHash}
                 self.players[key] = record
-            elif record["initials"] != initials.upper():
-                raise ValueError("That username uses different initials. Use its original initials or a new username.")
             player = Player(conn, record["username"], record["initials"])
             self.clients[key] = player
             self.waiting.append(player)
@@ -270,7 +302,13 @@ class PongServer:
         player = None
         try:
             with conn.makefile("rb") as stream:
-                player = self.register(conn, receiveMessage(stream))
+                # A recorded join message cannot be reused on another connection.
+                nonce = secrets.token_hex(16)
+                sendMessage(conn, {"type": "challenge", "nonce": nonce})
+                join = receiveMessage(stream)
+                if join.get("nonce") != nonce:
+                    raise ValueError("Invalid join challenge.")
+                player = self.register(conn, join)
                 sendMessage(conn, {"type": "hello", "width": Game.width, "height": Game.height,
                                    "username": player.username, "initials": player.initials})
                 while not self.stopped.is_set():
@@ -289,7 +327,8 @@ class PongServer:
 
     def leaderboardPage(self) -> bytes:
         with self.lock:
-            records = sorted((dict(p) for p in self.players.values()),
+            records = sorted(({key: p[key] for key in ("username", "initials", "wins")}
+                              for p in self.players.values()),
                              key=lambda p: (-p["wins"], p["username"].casefold()))
         rows = "".join(
             f"<tr><td>{i}</td><td>{escape(p['initials'])}</td>"

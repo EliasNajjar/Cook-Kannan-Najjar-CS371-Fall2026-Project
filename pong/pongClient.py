@@ -11,18 +11,31 @@ from typing import BinaryIO
 from assets.code.helperCode import Paddle, updateScore
 
 
+from cryptography.fernet import Fernet, InvalidToken
+
+
+# Shared key for the LAN demo. Anyone with the client has access to this key.
+FERNET = Fernet(b"xpg5hCKM6RP-Fxp71EQymasFcJ4gsZL-RkpaEwPUCiw=")
+MAX_TOKEN_LINE = 8192
+
+
 def sendMessage(conn: socket.socket, message: dict) -> None:
-    conn.sendall((json.dumps(message) + "\n").encode("utf-8"))
+    payload = json.dumps(message).encode("utf-8")
+    conn.sendall(FERNET.encrypt(payload) + b"\n")
 
 
 def receiveMessage(stream: BinaryIO) -> dict:
     # A buffered reader preserves extra messages and joins fragmented TCP reads.
-    line = stream.readline(4097)
+    line = stream.readline(MAX_TOKEN_LINE + 1)
     if not line:
         raise EOFError("Server or player disconnected")
-    if len(line) > 4096 or not line.endswith(b"\n"):
+    if len(line) > MAX_TOKEN_LINE or not line.endswith(b"\n"):
         raise ValueError("Invalid message length")
-    message = json.loads(line)
+    try:
+        payload = FERNET.decrypt(line[:-1])
+    except InvalidToken as error:
+        raise ValueError("Invalid encrypted message") from error
+    message = json.loads(payload)
     if not isinstance(message, dict):
         raise ValueError("Expected a JSON object")
     return message
@@ -233,7 +246,7 @@ def playGame(screenWidth: int, screenHeight: int, username: str,
         pygame.quit()
 
 
-def joinServer(ip: str, port: str, username: str, initials: str,
+def joinServer(ip: str, port: str, username: str, initials: str, password: str,
                errorLabel: tk.Label, app: tk.Tk) -> None:
     client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     client.settimeout(5)
@@ -242,7 +255,12 @@ def joinServer(ip: str, port: str, username: str, initials: str,
         client.connect((ip.strip(), int(port)))
         client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         stream = client.makefile("rb")
-        sendMessage(client, {"type": "join", "username": username.strip(), "initials": initials.strip()})
+        greeting = receiveMessage(stream)
+        if greeting.get("type") != "challenge" or not isinstance(greeting.get("nonce"), str):
+            raise ValueError("Invalid server greeting")
+        sendMessage(client, {"type": "join", "username": username.strip(),
+                             "initials": initials.strip(), "password": password,
+                             "nonce": greeting["nonce"]})
         hello = receiveMessage(stream)
         if hello.get("type") == "error":
             raise ValueError(hello["message"])
@@ -272,18 +290,19 @@ def startScreen() -> None:
     entries = {}
     for row, (label, default) in enumerate(
             (("Server IP", "127.0.0.1"), ("Server Port", "65432"),
-             ("Username", ""), ("Initials", "")), 1):
+             ("Username", ""), ("Initials", ""), ("Password", "")), 1):
         tk.Label(app, text=label + ":").grid(column=0, row=row, sticky="W", padx=8, pady=4)
-        entry = tk.Entry(app)
+        entry = tk.Entry(app, show="*" if label == "Password" else "")
         entry.insert(0, default)
         entry.grid(column=1, row=row, padx=8)
         entries[label] = entry
     errorLabel = tk.Label(app, text="", wraplength=400, fg="red")
-    errorLabel.grid(column=0, row=6, columnspan=2, padx=8, pady=8)
+    errorLabel.grid(column=0, row=7, columnspan=2, padx=8, pady=8)
     tk.Button(app, text="Join", command=lambda: joinServer(
         entries["Server IP"].get(), entries["Server Port"].get(),
-        entries["Username"].get(), entries["Initials"].get(), errorLabel, app)
-    ).grid(column=0, row=5, columnspan=2, pady=8)
+        entries["Username"].get(), entries["Initials"].get(),
+        entries["Password"].get(), errorLabel, app)
+    ).grid(column=0, row=6, columnspan=2, pady=8)
     app.mainloop()
 
 
