@@ -16,33 +16,16 @@ from cryptography.fernet import Fernet, InvalidToken
 
 # Shared key for the LAN demo. Anyone with the client has access to this key.
 FERNET = Fernet(b"xpg5hCKM6RP-Fxp71EQymasFcJ4gsZL-RkpaEwPUCiw=")
-MAX_TOKEN_LINE = 8192
+MAX_LEN = 8192
 
 
-def sendMessage(conn: socket.socket, message: dict) -> None:
-    payload = json.dumps(message).encode("utf-8")
-    conn.sendall(FERNET.encrypt(payload) + b"\n")
+def sendMessage(client: socket.socket, message: dict) -> None:
+    client.send(FERNET.encrypt(json.dumps(message).encode())) # encode and send fernet encrypted message to server
 
-
-def receiveMessage(stream: BinaryIO) -> dict:
-    # A buffered reader preserves extra messages and joins fragmented TCP reads.
-    line = stream.readline(MAX_TOKEN_LINE + 1)
-    if not line:
-        raise EOFError("Server or player disconnected")
-    if len(line) > MAX_TOKEN_LINE or not line.endswith(b"\n"):
-        raise ValueError("Invalid message length")
-    try:
-        payload = FERNET.decrypt(line[:-1])
-    except InvalidToken as error:
-        raise ValueError("Invalid encrypted message") from error
-    message = json.loads(payload)
-    if not isinstance(message, dict):
-        raise ValueError("Expected a JSON object")
-    return message
-
+def receiveMessage(client: socket.socket) -> dict:
+    return json.loads(FERNET.decrypt(client.recv(MAX_LEN))) # return decrypted and loaded dict object from server
 
 ASSETS = Path(__file__).resolve().parent / "assets"
-
 
 class Paddles:
     """Keep paddle setup, movement, snapshot updates and drawing together."""
@@ -107,7 +90,7 @@ class ServerConnection:
                                "match_id": token[0], "round": token[1],
                                "play_again": self.rematch is not None and self.rematch == token}
                 sendMessage(self.client, message)
-                state = receiveMessage(self.stream)
+                state = receiveMessage(self.client)
                 if state.get("type") == "error":
                     raise ValueError(state.get("message", "Server error"))
                 if state.get("type") != "state":
@@ -255,13 +238,13 @@ def joinServer(ip: str, port: str, username: str, initials: str, password: str,
         client.connect((ip.strip(), int(port)))
         client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         stream = client.makefile("rb")
-        greeting = receiveMessage(stream)
+        greeting = receiveMessage(client)
         if greeting.get("type") != "challenge" or not isinstance(greeting.get("nonce"), str):
             raise ValueError("Invalid server greeting")
         sendMessage(client, {"type": "join", "username": username.strip(),
                              "initials": initials.strip(), "password": password,
                              "nonce": greeting["nonce"]})
-        hello = receiveMessage(stream)
+        hello = receiveMessage(client)
         if hello.get("type") == "error":
             raise ValueError(hello["message"])
         if hello.get("type") != "hello":

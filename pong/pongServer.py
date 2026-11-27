@@ -5,13 +5,11 @@
 # Purpose: Simulate game, handle clients, and host leaderboard
 # =================================================================================================
 
-import argparse
 import hashlib
 import hmac
 import secrets
 import socket
 import json
-from typing import BinaryIO
 import threading
 import time
 import re
@@ -24,31 +22,19 @@ import pygame
 
 from cryptography.fernet import Fernet, InvalidToken
 
-
 # Shared key for the LAN demo. Anyone with the client has access to this key.
 FERNET = Fernet(b"xpg5hCKM6RP-Fxp71EQymasFcJ4gsZL-RkpaEwPUCiw=")
-MAX_TOKEN_LINE = 8192
+MAX_LEN = 8192
 
+ip = "0.0.0.0"
+gamePort = 65432
+leaderboardPort = 80
 
 def sendMessage(conn: socket.socket, message: dict) -> None:
-    payload = json.dumps(message).encode("utf-8")
-    conn.sendall(FERNET.encrypt(payload) + b"\n")
+    conn.send(FERNET.encrypt(json.dumps(message).encode())) # encode and send fernet encrypted message to conn
 
-def receiveMessage(stream: BinaryIO) -> dict:
-    # A buffered reader preserves extra messages and joins fragmented TCP reads.
-    line = stream.readline(MAX_TOKEN_LINE + 1)
-    if not line:
-        raise EOFError("Server or player disconnected")
-    if len(line) > MAX_TOKEN_LINE or not line.endswith(b"\n"):
-        raise ValueError("Invalid message length")
-    try:
-        payload = FERNET.decrypt(line[:-1])
-    except InvalidToken as error:
-        raise ValueError("Invalid encrypted message") from error
-    message = json.loads(payload)
-    if not isinstance(message, dict):
-        raise ValueError("Expected a JSON object")
-    return message
+def receiveMessage(conn: socket.socket) -> dict:
+    return json.loads(FERNET.decrypt(conn.recv(MAX_LEN))) # return decrypted and loaded dict object from conn
 
 
 class Game:
@@ -144,7 +130,6 @@ class Game:
 
 @dataclass(eq=False)
 class Player:
-    conn: socket.socket
     username: str
     initials: str
     match: "Match | None" = None
@@ -157,186 +142,175 @@ class Match:
     players: dict[str, Player]
     game: Game = field(default_factory=Game)
     rematch: set[str] = field(default_factory=set)
-    recorded: bool = False
     round: int = 1
 
+# The lock protects accounts, matchmaking, and game state across threads.
+players: dict[str, dict] = {}
+clients: dict[str, Player] = {}
+waiting: deque[Player] = deque()
+matches: dict[int, Match] = {}
+nextMatch = 1
+lock = threading.Lock()
 
-class PongServer:
-    def __init__(self) -> None:
-        self.players: dict[str, dict] = {}
-        self.clients: dict[str, Player] = {}
-        self.waiting: deque[Player] = deque()
-        self.matches: dict[int, Match] = {}
-        self.nextMatch = 1
-        self.lock = threading.Lock()
-        self.stopped = threading.Event()
-        self.httpServer: ThreadingHTTPServer | None = None
+def pairWaiting() -> None:
+    global nextMatch
+    while len(waiting) >= 2:
+        left = waiting.popleft()
+        right = waiting.popleft()
+        match = Match(nextMatch, {"left": left, "right": right})
+        matches[nextMatch] = match
+        nextMatch += 1
+        for side, player in match.players.items():
+            player.match, player.side = match, side
 
-    def pairWaiting(self) -> None:
-        """Called with the lock held; each player belongs to at most one match."""
-        while len(self.waiting) >= 2:
-            left, right = self.waiting.popleft(), self.waiting.popleft()
-            match = Match(self.nextMatch, {"left": left, "right": right})
-            self.nextMatch += 1
-            self.matches[match.number] = match
-            for side, player in match.players.items():
-                player.match, player.side = match, side
-
-    def recordWin(self, match: Match) -> None:
-        winner = match.game.winner()
-        if winner and not match.recorded:
-            username = match.players[winner].username.casefold()
-            self.players[username]["wins"] += 1
-            match.recorded = True
-
-    def simulate(self) -> None:
-        deadline = time.monotonic()
-        while not self.stopped.is_set():
-            with self.lock:
-                for match in self.matches.values():
-                    match.game.update()
-                    self.recordWin(match)
-            deadline += 1 / 60
-            self.stopped.wait(max(0, deadline - time.monotonic()))
-            if time.monotonic() - deadline > 1 / 60:
-                deadline = time.monotonic()
-
-    def register(self, conn: socket.socket, message: dict) -> Player:
-        username = message.get("username")
-        initials = message.get("initials")
-        password = message.get("password")
-        if message.get("type") != "join":
-            raise ValueError("Enter a username, initials and password to join.")
-        if not isinstance(username, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,20}", username):
-            raise ValueError("Username: use 1-20 letters, numbers, underscores or hyphens.")
-        if not isinstance(initials, str) or not re.fullmatch(r"[A-Za-z]{1,3}", initials):
-            raise ValueError("Initials: use 1-3 letters.")
-        if not isinstance(password, str) or not 1 <= len(password) <= 128:
-            raise ValueError("Password: use 1-128 characters.")
-        key = username.casefold()
-        initials = initials.upper()
-        with self.lock:
-            record = self.players.get(key)
-        salt = secrets.token_bytes(16) if record is None else record["salt"]
-        # Password hashing must not hold the lock used by the game simulation.
-        passwordHash = hashlib.scrypt(password.encode("utf-8"), salt=salt,
-                                      n=2**15, r=8, p=3, maxmem=64 * 1024**2, dklen=32)
-        if record is not None:
-            passwordMatches = hmac.compare_digest(passwordHash, record["password_hash"])
-            if not passwordMatches or record["initials"] != initials:
-                raise ValueError("Incorrect password or initials for that username.")
-        with self.lock:
-            if key in self.clients:
-                raise ValueError("That username is already connected.")
-            if self.players.get(key) is not record:
-                raise ValueError("That username was just registered. Try joining again.")
-            if record is None:
-                record = {"username": username, "initials": initials, "wins": 0,
-                          "salt": salt, "password_hash": passwordHash}
-                self.players[key] = record
-            player = Player(conn, record["username"], record["initials"])
-            self.clients[key] = player
-            self.waiting.append(player)
-            self.pairWaiting()
-            return player
-
-    def stateFor(self, player: Player) -> dict:
-        match = player.match
-        if match is None:
-            return {"type": "state", "phase": "waiting", "side": None,
-                    "match_id": None, "round": 0,
-                    "queue_position": list(self.waiting).index(player) + 1}
-        self.recordWin(match)
-        state = match.game.snapshot(True)
-        opponent = match.players["right" if player.side == "left" else "left"]
-        state.update(
-            phase="finished" if state["winner"] else "playing",
-            side=player.side, match_id=match.number, round=match.round,
-            you_ready=player.side in match.rematch,
-            opponent_ready=opponent.side in match.rematch,
-            opponent=opponent.username,
-            players={side: {"username": p.username, "initials": p.initials}
-                     for side, p in match.players.items()},
-        )
-        return state
-
-    def updatePlayer(self, player: Player, message: dict) -> dict:
-        if message.get("type") != "update":
-            raise ValueError("Expected a player update.")
-        if type(message.get("y")) is not int or type(message.get("play_again")) is not bool:
-            raise ValueError("Invalid player update.")
-        with self.lock:
-            match = player.match
-            # Ignore input from a previous match or round, including stale rematch clicks.
-            if (match is not None and message.get("match_id") == match.number
-                    and message.get("round") == match.round):
-                self.recordWin(match)
+def simulate(stopped: threading.Event) -> None:
+    deadline = time.monotonic()
+    while not stopped.is_set():
+        with lock:
+            for match in matches.values():
                 if match.game.winner():
-                    if message["play_again"]:
-                        match.rematch.add(player.side)
-                    if len(match.rematch) == 2:
-                        match.game = Game()
-                        match.rematch.clear()
-                        match.recorded = False
-                        match.round += 1
-                else:
-                    match.game.setPaddle(player.side, message["y"])
-            return self.stateFor(player)
+                    continue
+                match.game.update()
+                winner = match.game.winner()
+                if winner:
+                    username = match.players[winner].username.casefold()
+                    players[username]["wins"] += 1
+        deadline += 1 / 60
+        stopped.wait(max(0, deadline - time.monotonic()))
+        if time.monotonic() - deadline > 1 / 60:
+            deadline = time.monotonic()
 
-    def removePlayer(self, player: Player) -> None:
-        with self.lock:
-            self.clients.pop(player.username.casefold(), None)
-            if player in self.waiting:
-                self.waiting.remove(player)
-            match = player.match
-            if match is not None:
-                self.recordWin(match)
-                self.matches.pop(match.number, None)
-                for other in match.players.values():
-                    other.match, other.side = None, None
-                    if other is not player:
-                        self.waiting.append(other)
-            self.pairWaiting()
+def register(message: dict) -> Player:
+    username = message.get("username")
+    initials = message.get("initials")
+    password = message.get("password")
+    if message.get("type") != "join":
+        raise ValueError("Enter a username, initials and password to join.")
+    if not isinstance(username, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,20}", username):
+        raise ValueError("Username: use 1-20 letters, numbers, underscores or hyphens.")
+    if not isinstance(initials, str) or not re.fullmatch(r"[A-Za-z]{1,3}", initials):
+        raise ValueError("Initials: use 1-3 letters.")
+    if not isinstance(password, str) or not 1 <= len(password) <= 128:
+        raise ValueError("Password: use 1-128 characters.")
+    key = username.casefold()
+    initials = initials.upper()
+    with lock:
+        record = players.get(key)
+    salt = secrets.token_bytes(16) if record is None else record["salt"]
+    # Password hashing must not hold the lock used by the game simulation.
+    passwordHash = hashlib.scrypt(password.encode(), salt=salt, n=2**15, r=8, p=3, maxmem=64 * 1024**2, dklen=32)
+    if record is not None:
+        passwordMatches = hmac.compare_digest(passwordHash, record["password_hash"])
+        if not passwordMatches or record["initials"] != initials:
+            raise ValueError("Incorrect password or initials for that username.")
+    with lock:
+        if key in clients:
+            raise ValueError("That username is already connected.")
+        if players.get(key) is not record:
+            raise ValueError("That username was just registered. Try joining again.")
+        if record is None:
+            record = {"initials": initials, "wins": 0,
+                      "salt": salt, "password_hash": passwordHash}
+            players[key] = record
+        player = Player(key, record["initials"])
+        clients[key] = player
+        waiting.append(player)
+        pairWaiting()
+        return player
 
-    def handleClient(self, conn: socket.socket) -> None:
-        player = None
+def stateFor(player: Player) -> dict:
+    match = player.match
+    if match is None:
+        return {"type": "state", "phase": "waiting", "side": None,
+                "match_id": None, "round": 0,
+                "queue_position": list(waiting).index(player) + 1}
+    state = match.game.snapshot(True)
+    opponent = match.players["right" if player.side == "left" else "left"]
+    state.update(
+        phase="finished" if state["winner"] else "playing",
+        side=player.side, match_id=match.number, round=match.round,
+        you_ready=player.side in match.rematch,
+        opponent_ready=opponent.side in match.rematch,
+        opponent=opponent.username,
+        players={side: {"username": p.username, "initials": p.initials}
+                 for side, p in match.players.items()},
+    )
+    return state
+
+def updatePlayer(player: Player, message: dict) -> dict:
+    if message.get("type") != "update":
+        raise ValueError("Expected a player update.")
+    if type(message.get("y")) is not int or type(message.get("play_again")) is not bool:
+        raise ValueError("Invalid player update.")
+    with lock:
+        match = player.match
+        # Ignore input from a previous match or round, including stale rematch clicks.
+        if (match is not None and message.get("match_id") == match.number
+                and message.get("round") == match.round):
+            if match.game.winner():
+                if message["play_again"]:
+                    match.rematch.add(player.side)
+                if len(match.rematch) == 2:
+                    match.game = Game()
+                    match.rematch.clear()
+                    match.round += 1
+            else:
+                match.game.setPaddle(player.side, message["y"])
+        return stateFor(player)
+
+def removePlayer(player: Player) -> None:
+    with lock:
+        clients.pop(player.username.casefold(), None)
+        if player in waiting:
+            waiting.remove(player)
+        match = player.match
+        if match is not None:
+            matches.pop(match.number, None)
+            for other in match.players.values():
+                other.match, other.side = None, None
+                if other is not player:
+                    waiting.append(other)
+        pairWaiting()
+
+def handleClient(conn: socket.socket) -> None:
+    player = None
+    try:
+        # A recorded join message cannot be reused on another connection.
+        nonce = secrets.token_hex(16)
+        sendMessage(conn, {"type": "challenge", "nonce": nonce})
+        join = receiveMessage(conn)
+        if join.get("nonce") != nonce:
+            raise ValueError("Invalid join challenge.")
+        player = register(join)
+        sendMessage(conn, {"type": "hello", "width": Game.width, "height": Game.height,
+                            "username": player.username, "initials": player.initials})
+        while True:
+            sendMessage(conn, updatePlayer(player, receiveMessage(conn)))
+    except ValueError as error:
         try:
-            with conn.makefile("rb") as stream:
-                # A recorded join message cannot be reused on another connection.
-                nonce = secrets.token_hex(16)
-                sendMessage(conn, {"type": "challenge", "nonce": nonce})
-                join = receiveMessage(stream)
-                if join.get("nonce") != nonce:
-                    raise ValueError("Invalid join challenge.")
-                player = self.register(conn, join)
-                sendMessage(conn, {"type": "hello", "width": Game.width, "height": Game.height,
-                                   "username": player.username, "initials": player.initials})
-                while not self.stopped.is_set():
-                    sendMessage(conn, self.updatePlayer(player, receiveMessage(stream)))
-        except ValueError as error:
-            try:
-                sendMessage(conn, {"type": "error", "message": str(error)})
-            except OSError:
-                pass
-        except (OSError, EOFError):
+            sendMessage(conn, {"type": "error", "message": str(error)})
+        except OSError:
             pass
-        finally:
-            if player is not None:
-                self.removePlayer(player)
-            conn.close()
+    except (OSError, EOFError):
+        pass
+    finally:
+        if player is not None:
+            removePlayer(player)
+        conn.close()
 
-    def leaderboardPage(self) -> bytes:
-        with self.lock:
-            records = sorted(({key: p[key] for key in ("username", "initials", "wins")}
-                              for p in self.players.values()),
-                             key=lambda p: (-p["wins"], p["username"].casefold()))
-        rows = "".join(
-            f"<tr><td>{i}</td><td>{escape(p['initials'])}</td>"
-            f"<td>{escape(p['username'])}</td><td>{p['wins']}</td></tr>"
-            for i, p in enumerate(records, 1))
-        if not rows:
-            rows = '<tr><td colspan="4">No players yet. Join a game to get started.</td></tr>'
-        return ("""<!doctype html>
+
+def leaderboardPage() -> bytes:
+    with lock:
+        records = sorted(({key: p[key] for key in ("username", "initials", "wins")}
+                          for p in players.values()),
+                         key=lambda p: (-p["wins"], p["username"].casefold()))
+    rows = "".join(
+        f"<tr><td>{i}</td><td>{escape(p['initials'])}</td>"
+        f"<td>{escape(p['username'])}</td><td>{p['wins']}</td></tr>"
+        for i, p in enumerate(records, 1))
+    if not rows:
+        rows = '<tr><td colspan="4">No players yet. Join a game to get started.</td></tr>'
+    return ("""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="refresh" content="5"><title>Pong Leaderboard</title>
@@ -351,91 +325,43 @@ th{color:#89e2cb}footer{margin-top:24px;color:#afbdd3;font-size:.9rem}
 <table><thead><tr><th>Rank</th><th>Initials</th><th>Username</th><th>Wins</th></tr></thead>
 <tbody>""" + rows + """</tbody></table>
 <footer>Scores are held in memory and reset when the server restarts.</footer>
-</main></body></html>""").encode("utf-8")
+</main></body></html>""").encode()
 
-    def startLeaderboard(self, ip: str, port: int) -> threading.Thread:
-        owner = self
 
-        class Handler(BaseHTTPRequestHandler):
-            def do_GET(self) -> None:
-                if self.path not in ("/", "/leaderboard"):
-                    self.send_error(404)
-                    return
-                content = owner.leaderboardPage()
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("Content-Length", str(len(content)))
-                self.send_header("Cache-Control", "no-store")
-                self.end_headers()
-                self.wfile.write(content)
+class LeaderboardHandler(BaseHTTPRequestHandler):
+    def do_GET(self) -> None:
+        content = leaderboardPage()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(content)
 
-            def log_message(self, format, *args) -> None:
-                pass
-
-        self.httpServer = ThreadingHTTPServer((ip, port), Handler)
-        worker = threading.Thread(target=self.httpServer.serve_forever, daemon=True)
-        worker.start()
-        return worker
-
-    def serve(self, ip: str = "0.0.0.0", port: int = 65432,
-              leaderboard_port: int = 80) -> None:
-        workers = []
-        simulation = threading.Thread(target=self.simulate, daemon=True)
-        web = None
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
-                server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                server.bind((ip, port))
-                server.listen()
-                server.settimeout(0.2)
-                web = self.startLeaderboard(ip, leaderboard_port)
-                simulation.start()
-                print(f"Pong server listening on {ip}:{server.getsockname()[1]}")
-                print(f"Leaderboard listening on http://{ip}:{self.httpServer.server_port}")
-                while not self.stopped.is_set():
-                    try:
-                        conn, _ = server.accept()
-                    except socket.timeout:
-                        continue
-                    conn.settimeout(5)
-                    conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                    worker = threading.Thread(target=self.handleClient, args=(conn,), daemon=True)
-                    worker.start()
-                    workers = [w for w in workers if w.is_alive()]
-                    workers.append(worker)
-        finally:
-            self.stopped.set()
-            with self.lock:
-                connections = [p.conn for p in self.clients.values()]
-            for conn in connections:
-                try:
-                    conn.shutdown(socket.SHUT_RDWR)
-                except OSError:
-                    pass
-            if simulation.ident is not None:
-                simulation.join()
-            if self.httpServer is not None:
-                self.httpServer.shutdown()
-                self.httpServer.server_close()
-            if web is not None:
-                web.join()
-            for worker in workers:
-                worker.join(timeout=6)
-
+def serve() -> None:
+    stopped = threading.Event()
+    leaderboard = ThreadingHTTPServer((ip, leaderboardPort), LeaderboardHandler)
+    threading.Thread(target=leaderboard.serve_forever, daemon=True).start()
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.bind((ip, gamePort))
+    server.listen()
+    server.settimeout(0.25)
+    simulation = threading.Thread(target=simulate, args=(stopped,), daemon=True)
+    simulation.start()
+    try:
+        while True:
+            try:
+                conn, _ = server.accept()
+            except socket.timeout:
+                continue
+            conn.settimeout(5)
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            threading.Thread(target=handleClient, args=(conn,), daemon=True).start()
+    finally:
+        stopped.set()
+        leaderboard.shutdown()
+        simulation.join()
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run the Pong game server and leaderboard.")
-    parser.add_argument("--host", default="0.0.0.0", help="address to listen on (default: all interfaces)")
-    parser.add_argument("--port", type=int, default=65432, help="game port (default: 65432)")
-    parser.add_argument("--leaderboard-port", type=int, default=80, help="HTTP port (default: 80)")
-    args = parser.parse_args()
-    for port in (args.port, args.leaderboard_port):
-        if not 0 <= port <= 65535:
-            parser.error("ports must be between 0 and 65535")
     try:
-        PongServer().serve(args.host, args.port, args.leaderboard_port)
-    except KeyboardInterrupt:
+        serve()
+    except:
         pass
-    except OSError as error:
-        parser.exit(1, f"Pong server could not start or continue: {error}\n")
-
