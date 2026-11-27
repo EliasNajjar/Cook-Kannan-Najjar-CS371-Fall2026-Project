@@ -25,10 +25,18 @@ from cryptography.fernet import Fernet, InvalidToken
 FERNET = Fernet(b"xpg5hCKM6RP-Fxp71EQymasFcJ4gsZL-RkpaEwPUCiw=")
 MAX_LEN = 8192
 
-
+# Author: Elias Najjar
+# Purpose: Convert a message to JSON, encrypt it with Fernet, and send it.
+# Pre: client is connected, message is JSON serializable,
+#      and FERNET is initialized with the shared key.
+# Post: The encrypted message is submitted to the socket for sending.
 def sendMessage(client: socket.socket, message: dict) -> None:
     client.send(FERNET.encrypt(json.dumps(message).encode())) # encode and send fernet encrypted message to server
 
+# Author: Elias Najjar
+# Purpose: Receive a message from the server, decrypt it with Fernet, and return the decoded JSON object.
+# Pre: client is connected and FERNET is initialized with the shared key.
+# Post: The decrypted and loaded dict object is returned.
 def receiveMessage(client: socket.socket) -> dict:
     return json.loads(FERNET.decrypt(client.recv(MAX_LEN))) # return decrypted and loaded dict object from server
 
@@ -37,6 +45,11 @@ ASSETS = Path(__file__).resolve().parent / "assets"
 class Paddles:
     """Keep paddle setup, movement, snapshot updates and drawing together."""
 
+    # Author: Mohandass Kannan
+    # Purpose: Create the left and right paddles and initialize round tracking.
+    # Pre: Pygame is available, and width and height can accommodate the court.
+    # Post: Both paddles are positioned at their starting locations,
+    #       height is stored, and token is None.
     def __init__(self, width: int, height: int) -> None:
         self.height = height
         # Place both padddles at the vertical center of their sides
@@ -47,6 +60,13 @@ class Paddles:
         # Track the match and round to detect when the paddles need to reset
         self.token = None
 
+    # Author: Mohandass Kannan
+    # Purpose: Update the local paddle from keyboard input and the opponent's
+    #          paddle from server state.
+    # Pre: Paddles are initialized, Pygame input is available, and state includes
+    #      both paddle positions whenever a valid player side is assigned.
+    # Post: Paddle positions and round tracking are updated. The local paddle's
+    #       y-coordinate, or the default starting coordinate, is returned.
     def update(self, state: dict, connected: bool) -> int:
         side = state.get("side")
         token = (state.get("match_id"), state.get("round"))
@@ -77,6 +97,11 @@ class Paddles:
         # Provide our paddle position to the server
         return own.rect.y
 
+    # Author: Mohandass Kannan
+    # Purpose: Draw both paddles onto the supplied screen.
+    # Pre: Both paddles exist, screen is a valid Pygame surface,
+    #      and color is a valid Pygame color tuple.
+    # Post: Both paddle rectangles are drawn onto screen.
     def draw(self, screen: pygame.Surface, color: tuple) -> None:
         for paddle in self.bySide.values():
             pygame.draw.rect(screen, color, paddle.rect)
@@ -85,6 +110,12 @@ class Paddles:
 class ServerConnection:
     """Exchange snapshots in a background thread so the UI stays responsive."""
 
+    # Author: Mohandass Kannan and Elias Najjar
+    # Purpose: Initialize connection data and prepare the network thread.
+    # Pre: client is a connected socket, stream is its open binary read stream,
+    #      and startY is the initial paddle y-coordinate.
+    # Post: Shared data, synchronization objects, and the network thread are
+    #       initialized. The thread has not started.
     def __init__(self, client: socket.socket, stream: BinaryIO, startY: int) -> None:
         self.client = client
         self.stream = stream
@@ -108,8 +139,15 @@ class ServerConnection:
         self.thread = threading.Thread(target=self.exchange, daemon=True)
 
 
-    # Exchange messages with the server until the connection is stopped.
+    # Author: Mohandass Kannan
+    # Purpose: Repeatedly send player input and receive server game states
+    #          in the background.
+    # Pre: Connection data and synchronization objects are initialized,
+    #      and the socket is available for communication.
+    # Post: The loop ends when stopped or when a handled error occurs.
+    #       Received states are stored, and any handled error is recorded.
     def exchange(self) -> None:
+        # Exchange messages with the server until the connection is stopped.
         try:
             while not self.stopped.is_set():
                 with self.lock:
@@ -142,7 +180,12 @@ class ServerConnection:
             with self.lock:
                 self.error = f"Connection lost: {error}"
 
-    # Signal the network loop to stop
+    # Author: Mohandass Kannan
+    # Purpose: Stop network communication and wait for the network thread to exit.
+    # Pre: The network thread has started, and this method is called
+    #      from another thread.
+    # Post: The stop event is set, socket shutdown is attempted,
+    #       and the network thread has finished.
     def close(self) -> None:
         self.stopped.set()
         try:
@@ -155,7 +198,10 @@ class ServerConnection:
         self.thread.join()
 
 
-# Choose a status message based on the rematch readiness of both players.
+# Author: Mohandass Kannan
+# Purpose: Select a rematch status message based on both players' readiness.
+# Pre: state is a dictionary that may contain you_ready and opponent_ready.
+# Post: A status string is returned without modifying state.
 def rematchStatus(state: dict) -> str:
     if state.get("you_ready") and state.get("opponent_ready"):
         return "Starting next game..."
@@ -165,7 +211,11 @@ def rematchStatus(state: dict) -> str:
         return "Opponent wants to play again."
     return "Both players must click to restart."
 
-
+# Author: Mohandass Kannan, Hayden Cook, and Elias Najjar
+# Purpose: Handle player input and display gameplay using server updates.
+# Pre: The server has accepted the player, client and stream are open,
+#      screen dimensions are valid, and required assets are available.
+# Post: The network thread is stopped and Pygame resources are released.
 def playGame(screenWidth: int, screenHeight: int, username: str,
              client: socket.socket, stream: BinaryIO) -> None:
 
@@ -207,7 +257,10 @@ def playGame(screenWidth: int, screenHeight: int, username: str,
     lastPoints = lastBounces = 0
     running = True
 
-    # Draw text horizontally centered at the given height, with the given font and color.  The background is black.
+    # Author: Mohandass Kannan
+    # Purpose: Draw text horizontally centered at the specified vertical position.
+    # Pre: screen is initialized, font is loaded, and text is a string.
+    # Post: The rendered text is drawn onto screen, ready for display.
     def centered(text, font, y, color=WHITE):
         surface = font.render(text, False, color, (0, 0, 0))
         screen.blit(surface, surface.get_rect(center=(screenWidth // 2, y)))
@@ -308,6 +361,12 @@ def playGame(screenWidth: int, screenHeight: int, username: str,
         pygame.quit()
 
 
+# Author: Elias Najjar
+# Purpose: Connect to the server, submit player information, and start the game.
+# Pre: errorLabel and app are valid Tkinter objects, and connection information
+#      and player details are provided as strings.
+# Post: If joining fails, an error is displayed and the connection is closed.
+#       Otherwise, gameplay runs, then connection resources and app are closed.
 def joinServer(ip: str, port: str, username: str, initials: str, password: str,
                errorLabel: tk.Label, app: tk.Tk) -> None:
     
@@ -360,6 +419,13 @@ def joinServer(ip: str, port: str, username: str, initials: str, password: str,
         app.destroy()
 
 
+# Author: Mohandass Kannan, Elias Najjar, and Hayden Cook
+# Purpose: Display the join screen and let the player enter connection
+#          information and submit a request to join the server.
+# Pre: Tkinter is available, the logo image exists at the specified asset
+#      path, and joinServer is defined.
+# Post: The Tkinter event loop has ended. Join requests made through the
+#       form are handled by joinServer.
 def startScreen() -> None:
     app = tk.Tk()
     app.title("Join Pong")
