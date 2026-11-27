@@ -1,3 +1,10 @@
+# =================================================================================================
+# Contributing Authors:	    Mohandass Kannan, Elias Najjar, Hayden Cook
+# Email Addresses:          mka377@uky.edu, esna222@uky.edu, hwco227@uky.edu
+# Date:                     11/27/26
+# Purpose:                  UI for the user and displaying the game.  This file is the client side of the project and is responsible for connecting to the server and sending/receiving data.
+# =================================================================================================
+
 """Pong client with matchmaking, player names and mutual rematch controls."""
 
 import pygame
