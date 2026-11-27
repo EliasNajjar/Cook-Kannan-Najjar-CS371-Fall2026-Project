@@ -39,32 +39,42 @@ class Paddles:
 
     def __init__(self, width: int, height: int) -> None:
         self.height = height
+        # Place both padddles at the vertical center of their sides
         self.bySide = {
             "left": Paddle(pygame.Rect(10, height // 2 - 25, 10, 50)),
             "right": Paddle(pygame.Rect(width - 20, height // 2 - 25, 10, 50)),
         }
+        # Track the match and round to detect when the paddles need to reset
         self.token = None
 
     def update(self, state: dict, connected: bool) -> int:
         side = state.get("side")
         token = (state.get("match_id"), state.get("round"))
+
+        # Reset the position when a new match or round starts
         if token != self.token:
             for paddle in self.bySide.values():
                 paddle.rect.y = self.height // 2 - 25
             if side in self.bySide:
                 self.bySide[side].rect.topleft = state["paddles"][side]
             self.token = token
+
+        # return the starting position until the server assigns a side
         if side not in self.bySide:
             return self.height // 2 - 25
         # Move only our paddle locally; the opponent comes from the server.
         keys = pygame.key.get_pressed()
         movement = int(keys[pygame.K_DOWN]) - int(keys[pygame.K_UP])
         own = self.bySide[side]
+
+        # Move our paddle during play, keep it within the screen bounds, and update the opponent's paddle from the server.  The server is authoritative, so we don't move the opponent's paddle locally.
         if state.get("phase") == "playing" and connected:
             own.rect.y = max(10, min(self.height - 60, own.rect.y + movement * own.speed))
         for other, paddle in self.bySide.items():
             if other != side:
                 paddle.rect.topleft = state["paddles"][other]
+
+        # Provide our paddle position to the server
         return own.rect.y
 
     def draw(self, screen: pygame.Surface, color: tuple) -> None:
@@ -78,15 +88,27 @@ class ServerConnection:
     def __init__(self, client: socket.socket, stream: BinaryIO, startY: int) -> None:
         self.client = client
         self.stream = stream
+
+        # Store local input for the network to send
         self.y = startY
         self.inputToken = (None, None)
+
+        # Store the latest server state and any rematch request, along with any error message.  These are read by the UI thread while holding the lock to avoid race conditions.
         self.state: dict | None = None
         self.rematch: tuple | None = None
         self.error = ""
+
+        # Protect data shared between the game and the network
         self.lock = threading.Lock()
+
+        # Signal when the network thread should stop
         self.stopped = threading.Event()
+
+        # Prepare the network thread to start when thread.start() is called.  The thread is a daemon so it will exit when the main program exits.
         self.thread = threading.Thread(target=self.exchange, daemon=True)
 
+
+    # Exchange messages with the server until the connection is stopped.
     def exchange(self) -> None:
         try:
             while not self.stopped.is_set():
@@ -95,29 +117,45 @@ class ServerConnection:
                     token = self.inputToken
                     message = {"type": "update", "y": self.y,
                                "match_id": token[0], "round": token[1],
+                               # Send a rematch request only for the matching round, and only if the player clicked the button.  The server will ignore rematch requests for other rounds.
                                "play_again": self.rematch is not None and self.rematch == token}
+
+                # Send local input and receive the latest game state.
+
                 sendMessage(self.client, message)
                 state = receiveMessage(self.client)
+
+                # Reject server errors and unexpected messages
                 if state.get("type") == "error":
                     raise ValueError(state.get("message", "Server error"))
                 if state.get("type") != "state":
                     raise ValueError("Expected game state from server")
+
+                # Share the latest state with the game thread
                 with self.lock:
                     self.state = state
+
+                # Pause between every exchange to avoid overwhelming the server
                 self.stopped.wait(1 / 60)
         except (OSError, ValueError, EOFError) as error:
+            # Share connection errors so the game can display a message
             with self.lock:
                 self.error = f"Connection lost: {error}"
 
+    # Signal the network loop to stop
     def close(self) -> None:
         self.stopped.set()
         try:
+            # Interrupt any blocked socket reads or writes
             self.client.shutdown(socket.SHUT_RDWR)
         except OSError:
+            # The scoket may already be closed, ignore the error
             pass
+        # Wati for the thread to finish
         self.thread.join()
 
 
+# Choose a status message based on the rematch readiness of both players.
 def rematchStatus(state: dict) -> str:
     if state.get("you_ready") and state.get("opponent_ready"):
         return "Starting next game..."
@@ -130,16 +168,24 @@ def rematchStatus(state: dict) -> str:
 
 def playGame(screenWidth: int, screenHeight: int, username: str,
              client: socket.socket, stream: BinaryIO) -> None:
+
+    # Initialize Pygame and configure audio
     pygame.mixer.pre_init(44100, -16, 2, 2048)
     pygame.init()
     WHITE = (255, 255, 255)
     clock = pygame.time.Clock()
+
+    # Load fonts and sounds from the assets directory
+
     scoreFont = pygame.font.Font(str(ASSETS / "fonts/pong-score.ttf"), 32)
     winFont = pygame.font.Font(str(ASSETS / "fonts/visitor.ttf"), 40)
     statusFont = pygame.font.Font(str(ASSETS / "fonts/visitor.ttf"), 24)
     nameFont = pygame.font.Font(str(ASSETS / "fonts/visitor.ttf"), 20)
     pointSound = pygame.mixer.Sound(str(ASSETS / "sounds/point.wav"))
     bounceSound = pygame.mixer.Sound(str(ASSETS / "sounds/bounce.wav"))
+
+    # Create the game window and graphics
+
     screen = pygame.display.set_mode((screenWidth, screenHeight))
     pygame.display.set_caption(f"Pong - {username}")
     topWall = pygame.Rect(-10, 0, screenWidth + 20, 10)
@@ -149,18 +195,26 @@ def playGame(screenWidth: int, screenHeight: int, username: str,
     paddles = Paddles(screenWidth, screenHeight)
     ball = pygame.Rect(screenWidth // 2, screenHeight // 2, 5, 5)
     button = pygame.Rect(screenWidth // 2 - 110, screenHeight // 2 + 45, 220, 46)
+
+    # Run network communication in a background thread
+
     connection = ServerConnection(client, stream, screenHeight // 2 - 25)
     connection.thread.start()
+
+    # Track the current round and previously received sound-events to avoid replaying them multiple times
+
     lastToken = None
     lastPoints = lastBounces = 0
     running = True
 
+    # Draw text horizontally centered at the given height, with the given font and color.  The background is black.
     def centered(text, font, y, color=WHITE):
         surface = font.render(text, False, color, (0, 0, 0))
         screen.blit(surface, surface.get_rect(center=(screenWidth // 2, y)))
 
     try:
         while running:
+            # Read shared network data while holding the thread lock to avoid race conditions.  The lock is held only briefly, so the UI can remain responsive.
             with connection.lock:
                 state = connection.state
                 error = connection.error
@@ -169,6 +223,8 @@ def playGame(screenWidth: int, screenHeight: int, username: str,
             side = state.get("side")
             token = (state.get("match_id"), state.get("round"))
             finished = phase == "finished"
+
+            # Handle closing the window and clicking the rematch button
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     running = False
@@ -179,10 +235,12 @@ def playGame(screenWidth: int, screenHeight: int, username: str,
             if not running:
                 break
 
+            # Reset sound tracking when the match or round changes
             if token != lastToken:
                 lastPoints = lastBounces = 0
                 lastToken = token
 
+            # Update the paddle and share position with server
             paddleY = paddles.update(state, connected=not error)
             with connection.lock:
                 connection.y, connection.inputToken = paddleY, token
@@ -192,8 +250,11 @@ def playGame(screenWidth: int, screenHeight: int, username: str,
             if phase == "waiting":
                 status = "Waiting for opponent..."
             elif side in paddles.bySide:
+                # Use server's ball position and score
                 ball.topleft = state["ball"]
                 lScore, rScore = state["score"]["left"], state["score"]["right"]
+
+                # Play sounds only when the server reports a new point or bounce, to avoid replaying them multiple times
                 if state["points"] > lastPoints:
                     pointSound.play()
                 if state["bounces"] > lastBounces:
@@ -203,21 +264,29 @@ def playGame(screenWidth: int, screenHeight: int, username: str,
             if error:
                 status = "Disconnected - close window to rejoin"
 
+            # Clear the previous frames and draw court, paddles and scores
+
             screen.fill((0, 0, 0))
             for rect in centerLine + [topWall, bottomWall]:
                 pygame.draw.rect(screen, WHITE, rect)
             paddles.draw(screen, WHITE)
             updateScore(lScore, rScore, screen, WHITE, scoreFont)
+
+            # Display each player's username above their side of the court
             if side in paddles.bySide:
                 for playerSide, x in (("left", screenWidth // 4), ("right", 3 * screenWidth // 4)):
                     label = state["players"][playerSide]["username"]
                     surface = nameFont.render(label, False, WHITE, (0, 0, 0))
                     screen.blit(surface, surface.get_rect(center=(x, 88)))
+
             if finished:
+                # Show the result and rematch controls when the game is finished.
                 won = state["winner"] == side
                 centered("You win!" if won else "Opponent wins!", winFont, screenHeight // 2 - 25)
                 with connection.lock:
                     clicked = connection.rematch == token
+
+                # Show readiness immediately if the player clicked, or if the server reports that the player is ready.  The button is green when the player can click to ready up, and gray when the player is already ready or there is a connection error.
                 ready = state["you_ready"] or clicked
                 pygame.draw.rect(screen, (65, 85, 95) if ready or error else (30, 125, 95),
                                  button, border_radius=6)
@@ -229,40 +298,59 @@ def playGame(screenWidth: int, screenHeight: int, username: str,
                 pygame.draw.rect(screen, WHITE, ball)
             if status:
                 centered(status, statusFont, screenHeight - 35)
+
+            # Display frame and limit to 60 FPS.
             pygame.display.update()
             clock.tick(60)
     finally:
+        # Close the network connection and release the Pygame resources.
         connection.close()
         pygame.quit()
 
 
 def joinServer(ip: str, port: str, username: str, initials: str, password: str,
                errorLabel: tk.Label, app: tk.Tk) -> None:
+    
+    # Create a TCP conection with a five-second timeout
+
     client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     client.settimeout(5)
     stream = None
     try:
         client.connect((ip.strip(), int(port)))
+
+        # Send small messages promptly, need gameplay to be responsive
+
         client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         stream = client.makefile("rb")
+
+        # Verify that the server sent a valid challenge message, then send a join request with the username, initials, password and the nonce from the challenge. 
+
         greeting = receiveMessage(client)
         if greeting.get("type") != "challenge" or not isinstance(greeting.get("nonce"), str):
             raise ValueError("Invalid server greeting")
+        
         sendMessage(client, {"type": "join", "username": username.strip(),
                              "initials": initials.strip(), "password": password,
                              "nonce": greeting["nonce"]})
+
+        # Check if the server accepted the player
+        
         hello = receiveMessage(client)
         if hello.get("type") == "error":
             raise ValueError(hello["message"])
         if hello.get("type") != "hello":
             raise ValueError("Invalid server greeting")
+        
     except (OSError, ValueError, EOFError, OverflowError) as error:
+        # Clean up any failed connections and display the error message to the user
         if stream is not None:
             stream.close()
         client.close()
         errorLabel.config(text=str(error))
         return
 
+    # Hide the login window and start the game loop with the server-provided screen dimensions and username.  The game loop will handle closing the window when the game is over.
     app.withdraw()
     try:
         playGame(hello["width"], hello["height"], hello["username"], client, stream)
